@@ -148,6 +148,8 @@ class LocalSearchBudget:
     mib_sync_trials: int
     boundary_trials: int
     compaction_trials: int
+    ripup_trials: int = 0
+    frame_compaction_trials: int = 0
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -261,6 +263,30 @@ def _bbox_area(positions: Sequence[Rect]) -> float:
     y_min = min(y for _, y, _, _ in positions)
     x_max = max(x + w for x, _, w, _ in positions)
     y_max = max(y + h for _, y, _, h in positions)
+    return max(0.0, x_max - x_min) * max(0.0, y_max - y_min)
+
+
+def _bounds_with_rect(
+    bounds: Optional[Tuple[float, float, float, float]],
+    rect: Rect,
+) -> Tuple[float, float, float, float]:
+    x, y, width, height = rect
+    rect_bounds = (x, y, x + width, y + height)
+    if bounds is None:
+        return rect_bounds
+    x_min, y_min, x_max, y_max = bounds
+    return (
+        min(x_min, rect_bounds[0]),
+        min(y_min, rect_bounds[1]),
+        max(x_max, rect_bounds[2]),
+        max(y_max, rect_bounds[3]),
+    )
+
+
+def _bounds_area(bounds: Optional[Tuple[float, float, float, float]]) -> float:
+    if bounds is None:
+        return 0.0
+    x_min, y_min, x_max, y_max = bounds
     return max(0.0, x_max - x_min) * max(0.0, y_max - y_min)
 
 
@@ -1698,6 +1724,11 @@ def _constructive_seed_orders(
             sorted(units, key=_boundary_frame_sort_key),
             True,
         ),
+        (
+            "boundary_skyline_connected",
+            sorted(units, key=_boundary_frame_sort_key),
+            True,
+        ),
     ]
 
 
@@ -1951,6 +1982,194 @@ def _pack_bottom_left_origins(
         x, y = best_origin
         origins[unit.unit_id] = best_origin
         placed.append((x, y, width, height))
+        max_x = max(max_x, x + width)
+        max_y = max(max_y, y + height)
+
+    return origins, max_x, max_y
+
+
+def _unit_block_centers_at_origin(
+    unit: PlacementUnit,
+    origin: Tuple[float, float],
+) -> Dict[int, Tuple[float, float]]:
+    origin_x, origin_y = origin
+    centers: Dict[int, Tuple[float, float]] = {}
+    for block_id, (local_x, local_y, width, height) in unit.local_rects.items():
+        centers[block_id] = (
+            origin_x + local_x + width / 2.0,
+            origin_y + local_y + height / 2.0,
+        )
+    return centers
+
+
+def _block_centers_from_unit_origins(
+    units: Sequence[PlacementUnit],
+    origins: Dict[str, Tuple[float, float]],
+) -> Dict[int, Tuple[float, float]]:
+    centers: Dict[int, Tuple[float, float]] = {}
+    for unit in units:
+        if unit.unit_id in origins:
+            centers.update(_unit_block_centers_at_origin(unit, origins[unit.unit_id]))
+    return centers
+
+
+def _b2b_neighbors_by_block(parsed: ParsedInput) -> Dict[int, List[Tuple[int, float]]]:
+    neighbors: Dict[int, List[Tuple[int, float]]] = {}
+    for first, second, weight in parsed.b2b_edges:
+        edge_weight = abs(weight)
+        if not math.isfinite(edge_weight) or edge_weight <= 0.0:
+            continue
+        neighbors.setdefault(first, []).append((second, edge_weight))
+        neighbors.setdefault(second, []).append((first, edge_weight))
+    return neighbors
+
+
+def _p2b_edges_by_block(parsed: ParsedInput) -> Dict[int, List[Tuple[int, float]]]:
+    edges: Dict[int, List[Tuple[int, float]]] = {}
+    for pin_idx, block_id, weight in parsed.p2b_edges:
+        edge_weight = abs(weight)
+        if not math.isfinite(edge_weight) or edge_weight <= 0.0:
+            continue
+        edges.setdefault(block_id, []).append((pin_idx, edge_weight))
+    return edges
+
+
+def _unit_frontier_weight_indexed(
+    unit: PlacementUnit,
+    placed_centers: Dict[int, Tuple[float, float]],
+    b2b_neighbors: Dict[int, List[Tuple[int, float]]],
+) -> float:
+    if not placed_centers:
+        return 0.0
+    placed_ids = set(placed_centers)
+    return sum(
+        weight
+        for block_id in unit.block_ids
+        for other_id, weight in b2b_neighbors.get(block_id, ())
+        if other_id in placed_ids
+    )
+
+
+def _unit_site_connection_cost_indexed(
+    parsed: ParsedInput,
+    unit: PlacementUnit,
+    origin: Tuple[float, float],
+    placed_centers: Dict[int, Tuple[float, float]],
+    b2b_neighbors: Dict[int, List[Tuple[int, float]]],
+    p2b_by_block: Dict[int, List[Tuple[int, float]]],
+) -> float:
+    centers = _unit_block_centers_at_origin(unit, origin)
+    total = 0.0
+
+    for block_id, (bx, by) in centers.items():
+        for other_id, weight in b2b_neighbors.get(block_id, ()):
+            if other_id not in placed_centers:
+                continue
+            ox, oy = placed_centers[other_id]
+            total += weight * (abs(ox - bx) + abs(oy - by))
+
+        for pin_idx, weight in p2b_by_block.get(block_id, ()):
+            if not (0 <= pin_idx < len(parsed.pins)):
+                continue
+            px, py = parsed.pins[pin_idx]
+            total += weight * (abs(px - bx) + abs(py - by))
+
+    return _finite_metric(total)
+
+
+def _pack_connected_bottom_left_origins(
+    parsed: ParsedInput,
+    units: Sequence[PlacementUnit],
+    target_width: float,
+    global_offset: Tuple[float, float] = (0.0, 0.0),
+    fixed_block_centers: Optional[Dict[int, Tuple[float, float]]] = None,
+) -> Tuple[Dict[str, Tuple[float, float]], float, float]:
+    origins: Dict[str, Tuple[float, float]] = {}
+    if not units:
+        return origins, 0.0, 0.0
+
+    target_width = max(target_width, _max_unit_width(units), 1.0)
+    placed_rects: List[Rect] = []
+    placed_bounds: Optional[Tuple[float, float, float, float]] = None
+    placed_centers = dict(fixed_block_centers or {})
+    remaining = sorted(units, key=_seed_sort_key)
+    b2b_neighbors = _b2b_neighbors_by_block(parsed)
+    p2b_by_block = _p2b_edges_by_block(parsed)
+    pin_weights = {
+        unit.unit_id: sum(
+            weight
+            for block_id in unit.block_ids
+            for _, weight in p2b_by_block.get(block_id, ())
+        )
+        for unit in units
+    }
+    incident_weights = {
+        unit.unit_id: _unit_connectivity_weight(unit, parsed)
+        for unit in units
+    }
+    global_x, global_y = global_offset
+    max_x = 0.0
+    max_y = 0.0
+
+    while remaining:
+        unit = min(
+            remaining,
+            key=lambda candidate: (
+                -_unit_frontier_weight_indexed(
+                    candidate,
+                    placed_centers,
+                    b2b_neighbors,
+                ),
+                -pin_weights.get(candidate.unit_id, 0.0),
+                -incident_weights.get(candidate.unit_id, 0.0),
+                -_unit_area(candidate),
+                _unit_min_block_id(candidate),
+                candidate.unit_id,
+            ),
+        )
+        remaining.remove(unit)
+
+        width = _valid_unit_width(unit)
+        height = _valid_unit_height(unit)
+        best_origin: Optional[Tuple[float, float]] = None
+        best_key: Optional[Tuple[float, float, float, float, float, int, str]] = None
+
+        for x in _bottom_left_x_positions(placed_rects, target_width, width):
+            y = _bottom_left_y_at_x(x, width, height, placed_rects)
+            local_rect = (x, y, width, height)
+            bbox = _bounds_area(_bounds_with_rect(placed_bounds, local_rect))
+            connection_cost = _unit_site_connection_cost_indexed(
+                parsed,
+                unit,
+                (global_x + x, global_y + y),
+                placed_centers,
+                b2b_neighbors,
+                p2b_by_block,
+            )
+            key = (
+                connection_cost + PROXY_BBOX_WEIGHT * bbox,
+                connection_cost,
+                bbox,
+                y + height,
+                x,
+                _unit_min_block_id(unit),
+                unit.unit_id,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_origin = (x, y)
+
+        if best_origin is None:
+            best_origin = (0.0, max_y)
+
+        x, y = best_origin
+        origins[unit.unit_id] = best_origin
+        placed_rect = (x, y, width, height)
+        placed_rects.append(placed_rect)
+        placed_bounds = _bounds_with_rect(placed_bounds, placed_rect)
+        placed_centers.update(
+            _unit_block_centers_at_origin(unit, (global_x + x, global_y + y))
+        )
         max_x = max(max_x, x + width)
         max_y = max(max_y, y + height)
 
@@ -2314,15 +2533,76 @@ def _pack_skyline_units_as_candidate(
     return _best_constructive_candidate(candidates, context.parsed)
 
 
-def _pack_boundary_skyline_candidate(
+def _pack_connected_skyline_units_as_candidate(
     context: SolverContext,
     unit_set: PlacementUnitSet,
     ordered_units: Sequence[PlacementUnit],
     source: str,
     source_order: int,
 ) -> Optional[Candidate]:
+    fixed_origins = {
+        unit.unit_id: _constructive_origin_for_unit(unit, 0.0, 0.0)
+        for unit in ordered_units
+        if not unit.movable
+    }
+    movable_units = [unit for unit in ordered_units if unit.movable]
+    if not movable_units:
+        return _candidate_from_origins(
+            context,
+            unit_set,
+            fixed_origins,
+            source,
+            source_order,
+        )
+
+    candidates: List[Candidate] = []
+    x_origin, y_origin = _fallback_shelf_origin(context.immutable)
+    fixed_centers = _block_centers_from_unit_origins(
+        [unit for unit in ordered_units if not unit.movable],
+        fixed_origins,
+    )
+    for variant_index, target_width in enumerate(_skyline_width_hints(movable_units, 0.0)):
+        relative_origins, _, _ = _pack_connected_bottom_left_origins(
+            context.parsed,
+            movable_units,
+            target_width,
+            (x_origin, y_origin),
+            fixed_centers,
+        )
+        origins = dict(fixed_origins)
+        for unit_id, (local_x, local_y) in relative_origins.items():
+            origins[unit_id] = (x_origin + local_x, y_origin + local_y)
+        candidate = _candidate_from_origins(
+            context,
+            unit_set,
+            origins,
+            f"{source}:{variant_index}",
+            source_order,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return _best_constructive_candidate(candidates, context.parsed)
+
+
+def _pack_boundary_skyline_candidate(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    ordered_units: Sequence[PlacementUnit],
+    source: str,
+    source_order: int,
+    connected: bool = False,
+) -> Optional[Candidate]:
     movable_units = [unit for unit in ordered_units if unit.movable]
     if not any(unit.boundary_intent for unit in movable_units):
+        if connected:
+            return _pack_connected_skyline_units_as_candidate(
+                context,
+                unit_set,
+                ordered_units,
+                source,
+                source_order,
+            )
         return _pack_skyline_units_as_candidate(
             context,
             unit_set,
@@ -2365,13 +2645,33 @@ def _pack_boundary_skyline_candidate(
     )
 
     candidates: List[Candidate] = []
+    fixed_origins = {
+        unit.unit_id: _constructive_origin_for_unit(unit, 0.0, 0.0)
+        for unit in ordered_units
+        if not unit.movable
+    }
+    fixed_centers = _block_centers_from_unit_origins(
+        [unit for unit in ordered_units if not unit.movable],
+        fixed_origins,
+    )
     for variant_index, central_width_hint in enumerate(
         _skyline_width_hints(interior_units, rail_central_width)
     ):
-        relative_interior_origins, interior_width, interior_height = _pack_bottom_left_origins(
-            interior_units,
-            central_width_hint,
-        )
+        if connected:
+            relative_interior_origins, interior_width, interior_height = (
+                _pack_connected_bottom_left_origins(
+                    context.parsed,
+                    interior_units,
+                    central_width_hint,
+                    (0.0, 0.0),
+                    fixed_centers,
+                )
+            )
+        else:
+            relative_interior_origins, interior_width, interior_height = _pack_bottom_left_origins(
+                interior_units,
+                central_width_hint,
+            )
         central_width = max(rail_central_width, interior_width, central_width_hint)
         central_column_height = bottom_height + interior_height + top_height
         left_column_height = (
@@ -2483,6 +2783,15 @@ def _pack_constructive_seed(
             f"constructive:{seed_name}",
             source_order,
         )
+    if seed_name == "boundary_skyline_connected":
+        return _pack_boundary_skyline_candidate(
+            context,
+            unit_set,
+            ordered_units,
+            f"constructive:{seed_name}",
+            source_order,
+            True,
+        )
     return _pack_units_as_candidate(
         context,
         unit_set,
@@ -2517,8 +2826,8 @@ def _local_search_budget(block_count: int) -> LocalSearchBudget:
     if block_count <= 60:
         return LocalSearchBudget(25, 5, 5, 3, 4, 3, 3, 2)
     if block_count <= 100:
-        return LocalSearchBudget(29, 7, 7, 3, 4, 4, 3, 3)
-    return LocalSearchBudget(32, 8, 8, 4, 4, 4, 3, 3)
+        return LocalSearchBudget(34, 7, 7, 3, 4, 4, 3, 3, 4, 2)
+    return LocalSearchBudget(38, 8, 8, 4, 4, 4, 3, 3, 6, 2)
 
 
 def _unit_origin_from_candidate(unit: PlacementUnit, candidate: Candidate) -> Tuple[float, float]:
@@ -2547,6 +2856,1034 @@ def _unit_order_from_candidate(
             unit.unit_id,
         ),
     )
+
+
+def _unit_origin_map_from_candidate(
+    unit_set: PlacementUnitSet,
+    candidate: Candidate,
+) -> Dict[str, Tuple[float, float]]:
+    return {
+        unit.unit_id: _unit_origin_from_candidate(unit, candidate)
+        for unit in unit_set.units
+    }
+
+
+def _unit_bbox_at_origin(
+    unit: PlacementUnit,
+    origin: Tuple[float, float],
+) -> Rect:
+    return (
+        origin[0],
+        origin[1],
+        _valid_unit_width(unit),
+        _valid_unit_height(unit),
+    )
+
+
+def _ripup_window_size(block_count: int) -> int:
+    if block_count >= 110:
+        return 14
+    if block_count >= 100:
+        return 12
+    return 8
+
+
+def _ripup_window_limit(budget: LocalSearchBudget) -> int:
+    if budget.ripup_trials <= 0:
+        return 0
+    return max(1, min(3, (budget.ripup_trials + 1) // 2))
+
+
+def _unit_adjacency_by_id(
+    parsed: ParsedInput,
+    unit_set: PlacementUnitSet,
+) -> Dict[str, Dict[str, float]]:
+    adjacency: Dict[str, Dict[str, float]] = {
+        unit.unit_id: {} for unit in unit_set.units
+    }
+    for first, second, weight in parsed.b2b_edges:
+        first_unit = unit_set.block_to_unit.get(first)
+        second_unit = unit_set.block_to_unit.get(second)
+        if (
+            first_unit is None
+            or second_unit is None
+            or first_unit == second_unit
+        ):
+            continue
+        edge_weight = abs(weight)
+        if not math.isfinite(edge_weight) or edge_weight <= 0.0:
+            continue
+        adjacency[first_unit][second_unit] = (
+            adjacency[first_unit].get(second_unit, 0.0) + edge_weight
+        )
+        adjacency[second_unit][first_unit] = (
+            adjacency[second_unit].get(first_unit, 0.0) + edge_weight
+        )
+    return adjacency
+
+
+def _pin_weight_by_unit(
+    parsed: ParsedInput,
+    unit_set: PlacementUnitSet,
+) -> Dict[str, float]:
+    p2b_by_block = _p2b_edges_by_block(parsed)
+    return {
+        unit.unit_id: sum(
+            weight
+            for block_id in unit.block_ids
+            for _, weight in p2b_by_block.get(block_id, ())
+        )
+        for unit in unit_set.units
+    }
+
+
+def _eligible_ripup_unit_ids(unit_set: PlacementUnitSet) -> set:
+    return {
+        unit.unit_id
+        for unit in unit_set.units
+        if unit.movable and unit.boundary_intent == 0
+    }
+
+
+def _expand_ripup_window(
+    seed_ids: Sequence[str],
+    eligible_ids: set,
+    unit_by_id: Dict[str, PlacementUnit],
+    adjacency: Dict[str, Dict[str, float]],
+    unit_scores: Dict[str, float],
+    target_size: int,
+) -> Tuple[str, ...]:
+    selected: List[str] = []
+    selected_set = set()
+    for unit_id in sorted(
+        (unit_id for unit_id in seed_ids if unit_id in eligible_ids),
+        key=lambda item: (
+            -unit_scores.get(item, 0.0),
+            _unit_min_block_id(unit_by_id[item]),
+            item,
+        ),
+    ):
+        if unit_id not in selected_set:
+            selected.append(unit_id)
+            selected_set.add(unit_id)
+
+    if not selected:
+        return ()
+
+    target_size = max(1, target_size)
+    while len(selected) < target_size:
+        remaining = eligible_ids - selected_set
+        if not remaining:
+            break
+
+        def expansion_key(unit_id: str) -> Tuple[float, float, float, int, str]:
+            frontier = sum(
+                adjacency.get(unit_id, {}).get(placed_id, 0.0)
+                for placed_id in selected_set
+            )
+            unit = unit_by_id[unit_id]
+            return (
+                -frontier,
+                -unit_scores.get(unit_id, 0.0),
+                -_unit_area(unit),
+                _unit_min_block_id(unit),
+                unit_id,
+            )
+
+        next_unit_id = min(remaining, key=expansion_key)
+        selected.append(next_unit_id)
+        selected_set.add(next_unit_id)
+
+    return tuple(sorted(selected))
+
+
+def _ripup_windows(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    candidate: Candidate,
+    budget: LocalSearchBudget,
+) -> List[List[PlacementUnit]]:
+    parsed = context.parsed
+    if parsed.n < 80 or budget.ripup_trials <= 0:
+        return []
+    if len(candidate.positions) != parsed.n:
+        return []
+
+    unit_by_id = {unit.unit_id: unit for unit in unit_set.units}
+    eligible_ids = _eligible_ripup_unit_ids(unit_set)
+    if len(eligible_ids) < 2:
+        return []
+
+    adjacency = _unit_adjacency_by_id(parsed, unit_set)
+    block_centers = {
+        block_id: _center(candidate.positions[block_id])
+        for block_id in range(parsed.n)
+    }
+    unit_scores: Dict[str, float] = {unit_id: 0.0 for unit_id in eligible_ids}
+    scored_seeds: List[Tuple[float, Tuple[str, ...]]] = []
+
+    for first, second, weight in parsed.b2b_edges:
+        first_unit = unit_set.block_to_unit.get(first)
+        second_unit = unit_set.block_to_unit.get(second)
+        if (
+            first_unit is None
+            or second_unit is None
+            or first_unit == second_unit
+            or first not in block_centers
+            or second not in block_centers
+        ):
+            continue
+        edge_weight = abs(weight)
+        if not math.isfinite(edge_weight) or edge_weight <= 0.0:
+            continue
+        first_center = block_centers[first]
+        second_center = block_centers[second]
+        distance = abs(first_center[0] - second_center[0]) + abs(first_center[1] - second_center[1])
+        score = edge_weight * distance
+        if not math.isfinite(score) or score <= 0.0:
+            continue
+
+        seed_ids = tuple(sorted({
+            unit_id for unit_id in (first_unit, second_unit)
+            if unit_id in eligible_ids
+        }))
+        if not seed_ids:
+            continue
+        for unit_id in seed_ids:
+            unit_scores[unit_id] += score
+        scored_seeds.append((score, seed_ids))
+
+    for pin_idx, block_id, weight in parsed.p2b_edges:
+        unit_id = unit_set.block_to_unit.get(block_id)
+        if (
+            unit_id not in eligible_ids
+            or block_id not in block_centers
+            or not (0 <= pin_idx < len(parsed.pins))
+        ):
+            continue
+        edge_weight = abs(weight)
+        if not math.isfinite(edge_weight) or edge_weight <= 0.0:
+            continue
+        px, py = parsed.pins[pin_idx]
+        bx, by = block_centers[block_id]
+        score = edge_weight * (abs(px - bx) + abs(py - by))
+        if not math.isfinite(score) or score <= 0.0:
+            continue
+        unit_scores[unit_id] += score
+        scored_seeds.append((score, (unit_id,)))
+
+    if not scored_seeds:
+        scored_seeds = [
+            (unit_scores.get(unit_id, 0.0) + _unit_area(unit_by_id[unit_id]), (unit_id,))
+            for unit_id in eligible_ids
+        ]
+
+    target_size = _ripup_window_size(parsed.n)
+    windows: List[List[PlacementUnit]] = []
+    seen = set()
+    for _, seed_ids in sorted(
+        scored_seeds,
+        key=lambda item: (
+            -item[0],
+            tuple(_unit_min_block_id(unit_by_id[unit_id]) for unit_id in item[1]),
+            item[1],
+        ),
+    ):
+        if len(windows) >= _ripup_window_limit(budget):
+            break
+        window_ids = _expand_ripup_window(
+            seed_ids,
+            eligible_ids,
+            unit_by_id,
+            adjacency,
+            unit_scores,
+            target_size,
+        )
+        if len(window_ids) < 2 or window_ids in seen:
+            continue
+        seen.add(window_ids)
+        windows.append([unit_by_id[unit_id] for unit_id in window_ids])
+    return windows
+
+
+def _ripup_internal_greedy_order(
+    units: Sequence[PlacementUnit],
+    adjacency: Dict[str, Dict[str, float]],
+) -> List[PlacementUnit]:
+    unit_by_id = {unit.unit_id: unit for unit in units}
+    remaining = set(unit_by_id)
+    placed: set = set()
+    ordered: List[PlacementUnit] = []
+
+    while remaining:
+        def greedy_key(unit_id: str) -> Tuple[float, float, int, str]:
+            unit = unit_by_id[unit_id]
+            frontier = sum(
+                adjacency.get(unit_id, {}).get(placed_id, 0.0)
+                for placed_id in placed
+            )
+            incident = sum(
+                weight
+                for neighbor_id, weight in adjacency.get(unit_id, {}).items()
+                if neighbor_id in unit_by_id
+            )
+            return (
+                -frontier,
+                -incident,
+                _unit_min_block_id(unit),
+                unit_id,
+            )
+
+        unit_id = min(remaining, key=greedy_key)
+        remaining.remove(unit_id)
+        placed.add(unit_id)
+        ordered.append(unit_by_id[unit_id])
+    return ordered
+
+
+def _ripup_order_variants(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    candidate: Candidate,
+    window_units: Sequence[PlacementUnit],
+) -> List[List[PlacementUnit]]:
+    parsed = context.parsed
+    adjacency = _unit_adjacency_by_id(parsed, unit_set)
+    b2b_neighbors = _b2b_neighbors_by_block(parsed)
+    p2b_by_block = _p2b_edges_by_block(parsed)
+    window_block_ids = {
+        block_id for unit in window_units for block_id in unit.block_ids
+    }
+    anchor_centers = {
+        block_id: _center(candidate.positions[block_id])
+        for block_id in range(parsed.n)
+        if block_id not in window_block_ids
+    }
+    origins = _unit_origin_map_from_candidate(unit_set, candidate)
+    pin_weights = _pin_weight_by_unit(parsed, unit_set)
+
+    current_order = sorted(
+        window_units,
+        key=lambda unit: (
+            round(origins.get(unit.unit_id, (0.0, 0.0))[1], 6),
+            round(origins.get(unit.unit_id, (0.0, 0.0))[0], 6),
+            _unit_min_block_id(unit),
+            unit.unit_id,
+        ),
+    )
+    anchor_order = sorted(
+        window_units,
+        key=lambda unit: (
+            -_unit_frontier_weight_indexed(unit, anchor_centers, b2b_neighbors),
+            -pin_weights.get(unit.unit_id, 0.0),
+            -_unit_connectivity_weight(unit, parsed),
+            _unit_min_block_id(unit),
+            unit.unit_id,
+        ),
+    )
+    internal_order = _ripup_internal_greedy_order(window_units, adjacency)
+    pin_order = sorted(
+        window_units,
+        key=lambda unit: (
+            -pin_weights.get(unit.unit_id, 0.0),
+            -_unit_connectivity_weight(unit, parsed),
+            _unit_min_block_id(unit),
+            unit.unit_id,
+        ),
+    )
+
+    variants: List[List[PlacementUnit]] = []
+    seen = set()
+    for order in (anchor_order, internal_order, pin_order, current_order):
+        key = tuple(unit.unit_id for unit in order)
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(order)
+    return variants
+
+
+def _ripup_x_positions(
+    placed_rects: Sequence[Rect],
+    target_width: float,
+    width: float,
+    current_x: float,
+) -> List[float]:
+    x_limit = max(0.0, target_width - width)
+    candidates = set(_bottom_left_x_positions(placed_rects, target_width, width))
+    candidates.add(min(max(0.0, current_x), x_limit))
+    for placed_x, _, placed_width, _ in placed_rects:
+        candidates.add(placed_x)
+        candidates.add(placed_x + placed_width)
+        candidates.add(placed_x - width)
+    return sorted(
+        x
+        for x in candidates
+        if -OVERLAP_TOLERANCE <= x <= x_limit + OVERLAP_TOLERANCE
+    )
+
+
+def _pack_ripup_repack_candidate(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    start: Candidate,
+    window_units: Sequence[PlacementUnit],
+    ordered_window: Sequence[PlacementUnit],
+    source: str,
+    source_order: int,
+    width_scale: float,
+) -> Optional[Candidate]:
+    parsed = context.parsed
+    if len(start.positions) != parsed.n or not window_units:
+        return None
+
+    window_ids = {unit.unit_id for unit in window_units}
+    window_block_ids = {
+        block_id for unit in window_units for block_id in unit.block_ids
+    }
+    current_origins = _unit_origin_map_from_candidate(unit_set, start)
+    x_min = min(x for x, _, _, _ in start.positions)
+    y_min = min(y for _, y, _, _ in start.positions)
+    x_max = max(x + width for x, _, width, _ in start.positions)
+    current_width = max(1.0, x_max - x_min)
+    target_width = max(
+        current_width,
+        _max_unit_width(window_units),
+        1.0,
+    ) * max(1.0, width_scale)
+
+    origins: Dict[str, Tuple[float, float]] = {}
+    placed_rects: List[Rect] = []
+    placed_bounds: Optional[Tuple[float, float, float, float]] = None
+
+    for unit in unit_set.units:
+        origin = current_origins.get(unit.unit_id)
+        if origin is None or unit.unit_id in window_ids:
+            continue
+        origins[unit.unit_id] = origin
+        local_rect = (
+            origin[0] - x_min,
+            origin[1] - y_min,
+            _valid_unit_width(unit),
+            _valid_unit_height(unit),
+        )
+        placed_rects.append(local_rect)
+        placed_bounds = _bounds_with_rect(placed_bounds, local_rect)
+
+    placed_centers = {
+        block_id: _center(start.positions[block_id])
+        for block_id in range(parsed.n)
+        if block_id not in window_block_ids
+    }
+    b2b_neighbors = _b2b_neighbors_by_block(parsed)
+    p2b_by_block = _p2b_edges_by_block(parsed)
+
+    for unit in ordered_window:
+        current_origin = current_origins.get(unit.unit_id, (x_min, y_min))
+        current_local_x = current_origin[0] - x_min
+        width = _valid_unit_width(unit)
+        height = _valid_unit_height(unit)
+        best_origin: Optional[Tuple[float, float]] = None
+        best_key: Optional[Tuple[float, float, float, float, float, int, str]] = None
+
+        for x in _ripup_x_positions(placed_rects, target_width, width, current_local_x):
+            y = _bottom_left_y_at_x(x, width, height, placed_rects)
+            local_rect = (x, y, width, height)
+            next_bounds = _bounds_with_rect(placed_bounds, local_rect)
+            bbox = _bounds_area(next_bounds)
+            global_origin = (x_min + x, y_min + y)
+            connection_cost = _unit_site_connection_cost_indexed(
+                parsed,
+                unit,
+                global_origin,
+                placed_centers,
+                b2b_neighbors,
+                p2b_by_block,
+            )
+            displacement = (
+                abs(global_origin[0] - current_origin[0])
+                + abs(global_origin[1] - current_origin[1])
+            )
+            key = (
+                connection_cost + PROXY_BBOX_WEIGHT * bbox + 0.001 * displacement,
+                connection_cost,
+                bbox,
+                y + height,
+                displacement,
+                _unit_min_block_id(unit),
+                unit.unit_id,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_origin = global_origin
+
+        if best_origin is None:
+            best_origin = current_origin
+            local_rect = (
+                best_origin[0] - x_min,
+                best_origin[1] - y_min,
+                width,
+                height,
+            )
+        else:
+            local_rect = (
+                best_origin[0] - x_min,
+                best_origin[1] - y_min,
+                width,
+                height,
+            )
+
+        origins[unit.unit_id] = best_origin
+        placed_rects.append(local_rect)
+        placed_bounds = _bounds_with_rect(placed_bounds, local_rect)
+        placed_centers.update(_unit_block_centers_at_origin(unit, best_origin))
+
+    return _candidate_from_origins(
+        context,
+        unit_set,
+        origins,
+        source,
+        source_order,
+    )
+
+
+def _local_search_ripup_repack_trials(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    start: Candidate,
+    budget: LocalSearchBudget,
+    next_source_order: int,
+) -> Iterable[Candidate]:
+    trial_count = 0
+    for window_index, window_units in enumerate(
+        _ripup_windows(context, unit_set, start, budget)
+    ):
+        for variant_index, ordered_window in enumerate(
+            _ripup_order_variants(context, unit_set, start, window_units)
+        ):
+            if trial_count >= budget.ripup_trials:
+                return
+            width_scale = 1.0 if variant_index % 2 == 0 else 1.12
+            candidate = _pack_ripup_repack_candidate(
+                context,
+                unit_set,
+                start,
+                window_units,
+                ordered_window,
+                f"local:ripup_repack:{window_index}:{variant_index}",
+                next_source_order + trial_count,
+                width_scale,
+            )
+            if candidate is not None:
+                trial_count += 1
+                yield candidate
+
+
+def _positions_bounds(positions: Sequence[Rect]) -> Optional[Tuple[float, float, float, float]]:
+    bounds: Optional[Tuple[float, float, float, float]] = None
+    for rect in positions:
+        if _length(rect) != 4:
+            return None
+        x, y, width, height = rect
+        if not all(math.isfinite(value) for value in rect) or width <= 0.0 or height <= 0.0:
+            return None
+        bounds = _bounds_with_rect(bounds, rect)
+    return bounds
+
+
+def _frame_compaction_central_width_hints(
+    interior_units: Sequence[PlacementUnit],
+    rail_central_width: float,
+    current_width: float,
+    left_width: float,
+    right_width: float,
+) -> List[float]:
+    minimum = max(rail_central_width, _max_unit_width(interior_units), 1.0)
+    hints = {minimum}
+
+    if math.isfinite(current_width) and current_width > 0.0:
+        for scale in (0.55, 0.68, 0.82, 0.95):
+            compact_width = current_width * scale - left_width - right_width
+            if compact_width >= minimum - OVERLAP_TOLERANCE:
+                hints.add(max(minimum, compact_width))
+
+    for aspect in (0.8, 1.0, 1.25, 1.5):
+        width = _shelf_width_for_units(interior_units, aspect)
+        if width is not None and math.isfinite(width) and width > 0.0:
+            hints.add(max(minimum, width))
+
+    return sorted(hints)
+
+
+def _rail_axis_positions(
+    lower: float,
+    upper: float,
+    length: float,
+    preferred: float,
+    placed_intervals: Sequence[Tuple[float, float]],
+) -> List[float]:
+    if length <= 0.0 or upper - lower < length - OVERLAP_TOLERANCE:
+        return []
+
+    high = upper - length
+    clipped_preferred = min(max(preferred, lower), high)
+    raw_candidates = {lower, high, clipped_preferred}
+    for start, end in placed_intervals:
+        raw_candidates.add(start - length)
+        raw_candidates.add(end)
+        raw_candidates.add(start)
+        raw_candidates.add(end - length)
+
+    positions: List[float] = []
+    seen = set()
+    for raw in sorted(raw_candidates):
+        pos = min(max(raw, lower), high)
+        key = round(pos, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        if pos < lower - OVERLAP_TOLERANCE or pos > high + OVERLAP_TOLERANCE:
+            continue
+        overlaps = any(
+            pos < end - OVERLAP_TOLERANCE
+            and pos + length > start + OVERLAP_TOLERANCE
+            for start, end in placed_intervals
+        )
+        if not overlaps:
+            positions.append(pos)
+    return positions
+
+
+def _rail_unit_origin(
+    edge: str,
+    axis_position: float,
+    unit: PlacementUnit,
+    frame_x: float,
+    frame_y: float,
+    frame_width: float,
+    frame_height: float,
+) -> Tuple[float, float]:
+    width = _valid_unit_width(unit)
+    height = _valid_unit_height(unit)
+    if edge == "bottom":
+        return axis_position, frame_y
+    if edge == "top":
+        return axis_position, frame_y + frame_height - height
+    if edge == "left":
+        return frame_x, axis_position
+    return frame_x + frame_width - width, axis_position
+
+
+def _place_boundary_rail_units(
+    context: SolverContext,
+    units: Sequence[PlacementUnit],
+    edge: str,
+    axis_lower: float,
+    axis_upper: float,
+    frame_x: float,
+    frame_y: float,
+    frame_width: float,
+    frame_height: float,
+    current_origins: Dict[str, Tuple[float, float]],
+    origins: Dict[str, Tuple[float, float]],
+    placed_centers: Dict[int, Tuple[float, float]],
+) -> bool:
+    if not units:
+        return True
+
+    parsed = context.parsed
+    b2b_neighbors = _b2b_neighbors_by_block(parsed)
+    p2b_by_block = _p2b_edges_by_block(parsed)
+    placed_intervals: List[Tuple[float, float]] = []
+    horizontal = edge in {"bottom", "top"}
+
+    remaining = sorted(
+        units,
+        key=lambda unit: (
+            -_unit_frontier_weight_indexed(unit, placed_centers, b2b_neighbors),
+            -_unit_connectivity_weight(unit, parsed),
+            _unit_min_block_id(unit),
+            unit.unit_id,
+        ),
+    )
+
+    for unit in remaining:
+        length = _valid_unit_width(unit) if horizontal else _valid_unit_height(unit)
+        current_origin = current_origins.get(unit.unit_id, (frame_x, frame_y))
+        preferred = current_origin[0] if horizontal else current_origin[1]
+        best_origin: Optional[Tuple[float, float]] = None
+        best_axis: Optional[float] = None
+        best_key: Optional[Tuple[float, float, float, int, str]] = None
+
+        for axis_position in _rail_axis_positions(
+            axis_lower,
+            axis_upper,
+            length,
+            preferred,
+            placed_intervals,
+        ):
+            candidate_origin = _rail_unit_origin(
+                edge,
+                axis_position,
+                unit,
+                frame_x,
+                frame_y,
+                frame_width,
+                frame_height,
+            )
+            connection_cost = _unit_site_connection_cost_indexed(
+                parsed,
+                unit,
+                candidate_origin,
+                placed_centers,
+                b2b_neighbors,
+                p2b_by_block,
+            )
+            displacement = (
+                abs(candidate_origin[0] - current_origin[0])
+                + abs(candidate_origin[1] - current_origin[1])
+            )
+            key = (
+                connection_cost,
+                displacement,
+                axis_position,
+                _unit_min_block_id(unit),
+                unit.unit_id,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_axis = axis_position
+                best_origin = candidate_origin
+
+        if best_axis is None or best_origin is None:
+            return False
+
+        origins[unit.unit_id] = best_origin
+        placed_intervals.append((best_axis, best_axis + length))
+        placed_centers.update(_unit_block_centers_at_origin(unit, best_origin))
+
+    return True
+
+
+def _pack_frame_compaction_candidate(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    start: Candidate,
+    central_width_hint: float,
+    source: str,
+    source_order: int,
+) -> Optional[Candidate]:
+    ordered_units = _unit_order_from_candidate(unit_set, start)
+    movable_units = [unit for unit in ordered_units if unit.movable]
+    if not any(unit.boundary_intent for unit in movable_units):
+        return None
+
+    groups = _boundary_frame_groups(ordered_units)
+    corners = {
+        name: values[0] if values else None
+        for name, values in (
+            ("top_left", groups["top_left"]),
+            ("top_right", groups["top_right"]),
+            ("bottom_left", groups["bottom_left"]),
+            ("bottom_right", groups["bottom_right"]),
+        )
+    }
+    left_column_units = groups["left"]
+    right_column_units = groups["right"]
+    top_row_units = groups["top"]
+    bottom_row_units = groups["bottom"]
+    interior_units = groups["interior"]
+
+    left_width = max(
+        _max_unit_width(left_column_units),
+        _valid_unit_width(corners["top_left"]) if corners["top_left"] else 0.0,
+        _valid_unit_width(corners["bottom_left"]) if corners["bottom_left"] else 0.0,
+    )
+    right_width = max(
+        _max_unit_width(right_column_units),
+        _valid_unit_width(corners["top_right"]) if corners["top_right"] else 0.0,
+        _valid_unit_width(corners["bottom_right"]) if corners["bottom_right"] else 0.0,
+    )
+    top_height = _max_unit_height(top_row_units)
+    bottom_height = _max_unit_height(bottom_row_units)
+    rail_central_width = max(
+        _sum_unit_widths(top_row_units),
+        _sum_unit_widths(bottom_row_units),
+    )
+
+    central_width_hint = max(
+        central_width_hint,
+        rail_central_width,
+        _max_unit_width(interior_units),
+        1.0,
+    )
+    fixed_origins = {
+        unit.unit_id: _constructive_origin_for_unit(unit, 0.0, 0.0)
+        for unit in ordered_units
+        if not unit.movable
+    }
+    fixed_centers = _block_centers_from_unit_origins(
+        [unit for unit in ordered_units if not unit.movable],
+        fixed_origins,
+    )
+    relative_interior_origins, interior_width, interior_height = (
+        _pack_connected_bottom_left_origins(
+            context.parsed,
+            interior_units,
+            central_width_hint,
+            (0.0, 0.0),
+            fixed_centers,
+        )
+    )
+    central_width = max(central_width_hint, interior_width, rail_central_width)
+    central_column_height = bottom_height + interior_height + top_height
+    left_column_height = (
+        (_valid_unit_height(corners["bottom_left"]) if corners["bottom_left"] else 0.0)
+        + _sum_unit_heights(left_column_units)
+        + (_valid_unit_height(corners["top_left"]) if corners["top_left"] else 0.0)
+    )
+    right_column_height = (
+        (_valid_unit_height(corners["bottom_right"]) if corners["bottom_right"] else 0.0)
+        + _sum_unit_heights(right_column_units)
+        + (_valid_unit_height(corners["top_right"]) if corners["top_right"] else 0.0)
+    )
+
+    frame_width = max(left_width + central_width + right_width, 1.0)
+    frame_height = max(central_column_height, left_column_height, right_column_height, 1.0)
+    current_bounds = _positions_bounds(start.positions)
+    if context.immutable.obstacle_rects:
+        frame_x = _boundary_frame_x_origin(context, frame_width, movable_units)
+        frame_y, frame_height = _boundary_frame_y_origin_and_height(context, frame_height)
+    elif current_bounds is not None:
+        frame_x, frame_y, _, _ = current_bounds
+    else:
+        frame_x, frame_y = 0.0, 0.0
+
+    origins: Dict[str, Tuple[float, float]] = dict(fixed_origins)
+    central_x = frame_x + left_width
+    interior_y = frame_y + bottom_height
+    placed_centers = dict(fixed_centers)
+
+    for unit_id, (local_x, local_y) in relative_interior_origins.items():
+        unit_origin = (central_x + local_x, interior_y + local_y)
+        origins[unit_id] = unit_origin
+
+    interior_by_id = {unit.unit_id: unit for unit in interior_units}
+    for unit_id, origin in origins.items():
+        unit = interior_by_id.get(unit_id)
+        if unit is not None:
+            placed_centers.update(_unit_block_centers_at_origin(unit, origin))
+
+    corner_origins = {
+        "bottom_left": (frame_x, frame_y),
+        "bottom_right": (
+            frame_x + frame_width - (_valid_unit_width(corners["bottom_right"]) if corners["bottom_right"] else 0.0),
+            frame_y,
+        ),
+        "top_left": (
+            frame_x,
+            frame_y + frame_height - (_valid_unit_height(corners["top_left"]) if corners["top_left"] else 0.0),
+        ),
+        "top_right": (
+            frame_x + frame_width - (_valid_unit_width(corners["top_right"]) if corners["top_right"] else 0.0),
+            frame_y + frame_height - (_valid_unit_height(corners["top_right"]) if corners["top_right"] else 0.0),
+        ),
+    }
+    for corner_name, unit in corners.items():
+        if unit is None:
+            continue
+        origin = corner_origins[corner_name]
+        origins[unit.unit_id] = origin
+        placed_centers.update(_unit_block_centers_at_origin(unit, origin))
+
+    current_origins = _unit_origin_map_from_candidate(unit_set, start)
+    if not _place_boundary_rail_units(
+        context,
+        bottom_row_units,
+        "bottom",
+        central_x,
+        central_x + central_width,
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+        current_origins,
+        origins,
+        placed_centers,
+    ):
+        return None
+    if not _place_boundary_rail_units(
+        context,
+        top_row_units,
+        "top",
+        central_x,
+        central_x + central_width,
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+        current_origins,
+        origins,
+        placed_centers,
+    ):
+        return None
+
+    left_lower = frame_y + (
+        _valid_unit_height(corners["bottom_left"]) if corners["bottom_left"] else 0.0
+    )
+    left_upper = frame_y + frame_height - (
+        _valid_unit_height(corners["top_left"]) if corners["top_left"] else 0.0
+    )
+    right_lower = frame_y + (
+        _valid_unit_height(corners["bottom_right"]) if corners["bottom_right"] else 0.0
+    )
+    right_upper = frame_y + frame_height - (
+        _valid_unit_height(corners["top_right"]) if corners["top_right"] else 0.0
+    )
+    if not _place_boundary_rail_units(
+        context,
+        left_column_units,
+        "left",
+        left_lower,
+        left_upper,
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+        current_origins,
+        origins,
+        placed_centers,
+    ):
+        return None
+    if not _place_boundary_rail_units(
+        context,
+        right_column_units,
+        "right",
+        right_lower,
+        right_upper,
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+        current_origins,
+        origins,
+        placed_centers,
+    ):
+        return None
+
+    return _candidate_from_origins(
+        context,
+        unit_set,
+        origins,
+        source,
+        source_order,
+    )
+
+
+def _local_search_frame_compaction_trials(
+    context: SolverContext,
+    unit_set: PlacementUnitSet,
+    start: Candidate,
+    budget: LocalSearchBudget,
+    next_source_order: int,
+) -> Iterable[Candidate]:
+    parsed = context.parsed
+    if (
+        parsed.n < 100
+        or budget.frame_compaction_trials <= 0
+        or not parsed.boundary_masks
+        or len(start.positions) != parsed.n
+    ):
+        return
+
+    start_report = start.hard_report or _preflight(
+        start,
+        parsed,
+        context.immutable,
+        context.dimensions,
+    )
+    if not start_report.hard_feasible:
+        return
+    start.hard_report = start_report
+    if start.proxy_score is None:
+        start.proxy_score = _score_candidate(start, parsed)
+
+    ordered_units = _unit_order_from_candidate(unit_set, start)
+    movable_units = [unit for unit in ordered_units if unit.movable]
+    if not any(unit.boundary_intent for unit in movable_units):
+        return
+
+    groups = _boundary_frame_groups(ordered_units)
+    corners = {
+        name: values[0] if values else None
+        for name, values in (
+            ("top_left", groups["top_left"]),
+            ("top_right", groups["top_right"]),
+            ("bottom_left", groups["bottom_left"]),
+            ("bottom_right", groups["bottom_right"]),
+        )
+    }
+    left_width = max(
+        _max_unit_width(groups["left"]),
+        _valid_unit_width(corners["top_left"]) if corners["top_left"] else 0.0,
+        _valid_unit_width(corners["bottom_left"]) if corners["bottom_left"] else 0.0,
+    )
+    right_width = max(
+        _max_unit_width(groups["right"]),
+        _valid_unit_width(corners["top_right"]) if corners["top_right"] else 0.0,
+        _valid_unit_width(corners["bottom_right"]) if corners["bottom_right"] else 0.0,
+    )
+    rail_central_width = max(
+        _sum_unit_widths(groups["top"]),
+        _sum_unit_widths(groups["bottom"]),
+    )
+    current_bounds = _positions_bounds(start.positions)
+    if current_bounds is None:
+        return
+    current_width = max(1.0, current_bounds[2] - current_bounds[0])
+
+    candidates: List[Candidate] = []
+    for variant_index, central_width in enumerate(
+        _frame_compaction_central_width_hints(
+            groups["interior"],
+            rail_central_width,
+            current_width,
+            left_width,
+            right_width,
+        )
+    ):
+        candidate = _pack_frame_compaction_candidate(
+            context,
+            unit_set,
+            start,
+            central_width,
+            f"local:frame_compact:{variant_index}",
+            next_source_order + variant_index,
+        )
+        if candidate is None:
+            continue
+        candidate.proxy_score = _score_candidate(candidate, parsed)
+        if (
+            candidate.hard_report is not None
+            and candidate.hard_report.violations_relative
+            <= start_report.violations_relative + 1e-12
+        ):
+            candidates.append(candidate)
+
+    seen = set()
+    yielded = 0
+    for candidate in sorted(candidates, key=CandidateManager._candidate_key):
+        key = tuple(
+            (round(x, 6), round(y, 6), round(width, 6), round(height, 6))
+            for x, y, width, height in candidate.positions
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        yield candidate
+        yielded += 1
+        if yielded >= budget.frame_compaction_trials:
+            return
 
 
 def _repair_immutable_geometry(
@@ -3134,6 +4471,20 @@ def _run_local_search(
             yielded += 1
             yield candidate
 
+    if yielded < budget.max_trials and budget.ripup_trials > 0:
+        ripup_source = manager.best_feasible_or_fallback()
+        for candidate in _local_search_ripup_repack_trials(
+            context,
+            unit_set,
+            ripup_source,
+            budget,
+            next_source_order + 120,
+        ):
+            if yielded >= budget.max_trials:
+                return
+            yielded += 1
+            yield candidate
+
     if yielded < budget.max_trials and budget.compaction_trials > 0:
         compaction_source = manager.best_feasible_or_fallback()
         compacted = _compact_candidate(
@@ -3155,7 +4506,22 @@ def _run_local_search(
             next_source_order + 110,
         )
         if snapped is not None:
+            yielded += 1
             yield snapped
+
+    if yielded < budget.max_trials and budget.frame_compaction_trials > 0:
+        frame_source = manager.best_feasible_or_fallback()
+        for candidate in _local_search_frame_compaction_trials(
+            context,
+            unit_set,
+            frame_source,
+            budget,
+            next_source_order + 140,
+        ):
+            if yielded >= budget.max_trials:
+                return
+            yielded += 1
+            yield candidate
 
 
 def _finalize_positions(candidate: Candidate, block_count: int) -> List[Rect]:

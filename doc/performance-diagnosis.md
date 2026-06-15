@@ -1,14 +1,12 @@
 # Performance Diagnosis
 
-## Status Update
-
-The recommended first optimization in this diagnosis has been implemented. The current recorded local validation result is attempt 3 in `doc/performance-log.md`: score `4.5564`, `100/100` feasible, avg runtime `0.0871` s/case, output `/tmp/my_optimizer_boundary_skyline_results.json`. This document remains useful as the rationale for that change, but its `5.3511` baseline is now historical.
-
 ## Purpose
 
-Diagnose why the current `iccad2026contest/my_optimizer.py` validation score remains at `5.3511` and has not converged below the user's target score of `3.0`, despite 100/100 feasible validation cases.
+Diagnose why the current `iccad2026contest/my_optimizer.py` validation score is
+`4.3887` despite `100/100` feasible cases, and identify the next optimization
+most likely to move the score toward `2.0` or below.
 
-This is diagnosis only. No optimizer, evaluator, dataset, or smoke-test source code was changed.
+This is diagnosis only. No optimizer implementation code was changed.
 
 ## Diagnosis Scope
 
@@ -19,9 +17,17 @@ cd iccad2026contest
 python3 iccad2026_evaluate.py --evaluate my_optimizer.py
 ```
 
-The evaluator was not rerun. I parsed `iccad2026contest/my_optimizer_results.json`, read the optimizer and evaluator source, and recomputed soft-violation family counts from saved positions plus local validation tensors in read-only mode.
+The evaluator was not rerun during this diagnosis. I used the user-provided
+terminal output, parsed `iccad2026contest/my_optimizer_results.json` read-only,
+compared it with prior result JSONs under `/tmp`, and inspected the current
+optimizer/evaluator source.
 
-The previous diagnosis in this file targeted the older `7.1293` score and recommended the boundary-frame constructive seed. That optimization has already been implemented and logged in `doc/performance-log.md`; this diagnosis supersedes it.
+Prior comparison artifacts used:
+
+- `/tmp/my_optimizer_boundary_skyline_results.json`
+- `/tmp/my_optimizer_boundary_skyline_connected_results.json`
+- `/tmp/my_optimizer_ripup_repack_results.json`
+- `/tmp/my_optimizer_frame_compaction_large_results.json`
 
 ## Source Documents Read
 
@@ -34,101 +40,110 @@ The previous diagnosis in this file targeted the older `7.1293` score and recomm
 - `doc/quality-gates.md`
 - `doc/tasks/progress.md`
 - `doc/performance-log.md`
-- Prior `doc/performance-diagnosis.md`
+- prior `doc/performance-diagnosis.md`
 - `iccad2026contest/README.md`
 - `iccad2026contest/iccad2026_evaluate.py`
 - `iccad2026contest/my_optimizer.py`
 - `iccad2026contest/my_optimizer_results.json`
-- Local validation tensors under `LiteTensorDataTest/config_*/`, read directly for soft-family recomputation.
-
-Markdown files to check first when resuming:
-
-1. `doc/performance-log.md` for the score history and what has already been tried.
-2. `doc/performance-diagnosis.md` for the current bottleneck analysis and the next recommended attempt.
-3. `doc/tasks/progress.md` for implemented modules, smoke coverage, and known evaluator runs.
-4. `doc/detailed-design.md` for unresolved design choices, especially packing representation, proxy weights, and local-search budget.
-5. `doc/test-plan.md` and `doc/quality-gates.md` before changing code or running evaluator commands.
 
 ## Current Correctness Status
 
-The current saved evaluator result reports `100/100` feasible cases. All `test_results[*].is_feasible` values are true, so hard correctness is stable enough for optimization.
+The saved evaluator result reports `100/100` feasible cases. All
+`test_results[*].is_feasible` values are true, so hard correctness is stable
+enough for optimization.
 
-Known passing checks from `doc/tasks/progress.md` include smoke scripts for parser, optimizer entry, immutable geometry, dimension planning, fallback, macro planning, constructive initialization, candidate manager, proxy scoring, local search, and preflight. The progress log also records a passed `python -B iccad2026_evaluate.py --validate my_optimizer.py` after the boundary-frame optimization.
+Known passing checks from `doc/tasks/progress.md` include all optimizer smoke
+scripts and:
+
+```bash
+python -B iccad2026_evaluate.py --validate my_optimizer.py
+```
 
 Checks not rerun in this diagnosis:
 
 - `python3 iccad2026_evaluate.py --validate my_optimizer.py`
 - `python3 iccad2026_evaluate.py --evaluate my_optimizer.py`
-- Any full smoke-test batch
+- The full smoke-test batch
 - Memory profiling
 
-The remaining issue is quality, not basic correctness.
+The remaining issue is layout quality, not feasibility.
 
 ## Current Performance Baseline
 
 | Metric | Value | Command | Verified? |
 |---|---:|---|---|
-| Score | 5.3511 | `cd iccad2026contest && python3 iccad2026_evaluate.py --evaluate my_optimizer.py` | User-provided run; saved JSON parsed and weighted score recomputed |
-| Runtime | avg 0.0489 s/case; weighted avg 0.1048 s/case | Same evaluator command | Saved JSON parsed; local runtime factor is neutral |
+| Score | 4.3887 | `cd iccad2026contest && python3 iccad2026_evaluate.py --evaluate my_optimizer.py` | User-provided run; saved JSON parsed read-only |
+| Runtime | avg 0.3620 s/case; max 3.9774 s/case | Same evaluator command | Saved JSON parsed; local runtime factor is neutral |
 | Memory | Unknown | Not measured | Missing |
 
-Additional baseline details:
+Additional baseline details from `my_optimizer_results.json`:
 
 - Feasible: `100/100`
-- Average cost: `5.0067`
-- Weighted HPWL gap: `2.2538`
-- Weighted area gap: `2.1630`
-- Weighted violations relative: `0.2534`
-- Weighted boundary violations: `12.2668`
-- Weighted grouping violations: `2.5741`
-- Weighted MIB violations: `0.0000`
-- Weighted geometry density: `0.3107`
-- Weighted approximate row count: `35.8660`
-- No feasible cases are cost-capped at `9.999999`.
+- Average cost: `4.3428`
+- Average HPWL gap: `1.7845`; weighted HPWL gap: `1.6416`
+- Average area gap: `1.5889`; weighted area gap: `1.6645`
+- Average violations relative: `0.2378`; weighted violations relative: `0.2486`
+- Cases with `101-120` blocks carry `81.13%` of total score weight.
+- Cases with `81-100` blocks carry `15.32%` of total score weight.
+- Cases with `21-80` blocks together carry only `3.54%` of total score weight.
 
 ## Expected Performance Target
 
-The current user target is local total score below `3.0`.
+The current user target is score around `2.0` or below.
 
 Current gap:
 
-- Current score: `5.3511`
-- Target score: `< 3.0`
-- Required reduction: at least `2.3511` score points, or about `43.9%`
+- Current score: `4.3887`
+- Target score: `<= 2.0`
+- Required reduction: at least `2.3887` score points, or about `54.4%`
 
-Important sensitivity result: with current HPWL and area gaps, eliminating all remaining soft violations projects only about `3.2084`, still above `3.0`. Therefore, the next optimization cannot be boundary-only or soft-violation-only. It must reduce HPWL and bounding-box area while preserving the boundary-frame gain.
+Sensitivity projections from the current saved cases:
+
+- Zero all soft violations, current HPWL/area: projected score `2.6531`
+- Zero HPWL and area gaps only, current soft violations: projected score `1.6511`
+- Half HPWL, half area, and half soft: projected score `2.3461`
+
+Therefore, score `<= 2.0` requires simultaneous improvement in HPWL,
+bounding-box area, and soft violations. Soft cleanup alone is insufficient, and
+small local improvements are now too weak.
 
 ## Gap Analysis
 
-The boundary-frame optimization moved the solver from a soft-violation bottleneck into a combined packing-quality bottleneck.
+Recent changes show clear diminishing returns:
 
-Current weighted cost drivers:
+| Attempt | Score | Weighted HPWL Gap | Weighted Area Gap | Weighted V_rel | Avg Runtime |
+|---|---:|---:|---:|---:|---:|
+| `boundary_skyline` | 4.5564 | 1.8390 | 1.6547 | 0.2499 | 0.0871 s |
+| `boundary_skyline_connected` | 4.5063 | 1.7766 | 1.6621 | 0.2499 | 0.1536 s |
+| `ripup_repack` | 4.4080 | 1.6665 | 1.6621 | 0.2486 | 0.2680 s |
+| `frame_compaction_large` | 4.3887 | 1.6416 | 1.6645 | 0.2486 | 0.3514-0.3620 s |
 
-- HPWL gap is high: `2.2538`
-- Area gap is high: `2.1630`
-- Soft violations are still meaningful: `0.2534` relative, mostly boundary
-- Runtime is not the local score bottleneck because local evaluation uses `RuntimeFactor=1.0`
+The latest frame-compaction pass improved only `5/100` cases, worsened none,
+and reduced score by `0.0192`. It lowered weighted HPWL but slightly increased
+weighted area and did not change weighted soft violations.
 
-Sensitivity projections from current saved cases:
+The current worst weighted contributors are large cases:
 
-- Zero all soft violations: score about `3.2084`
-- Zero boundary violations only: score about `3.5104`
-- Half boundary violations: score about `4.3315`
-- Zero grouping violations only: score about `4.8846`
-- Half HPWL gap only: score about `4.4114`
-- Half area gap only: score about `4.4492`
-- Half HPWL and half area with current soft: score about `3.5095`
-- Half HPWL, half area, and half soft: score about `2.7142`
+- test 98, 119 blocks: contribution `0.4037`, cost `5.4866`
+- test 99, 120 blocks: contribution `0.3154`, cost `3.9441`
+- test 95, 116 blocks: contribution `0.2946`, cost `5.1402`
+- test 97, 118 blocks: contribution `0.2684`, cost `3.9642`
+- test 94, 115 blocks: contribution `0.2368`, cost `4.4913`
+- test 89, 110 blocks: contribution `0.2249`, cost `6.4711`
+- test 92, 113 blocks: contribution `0.2249`, cost `5.0388`
 
-Large cases matter most. Cases with 101 to 120 blocks carry about `81.1%` of the total score weight, and cases 116 to 120 carry about `34.1%`.
+High-cost cases are broad, not isolated:
 
-Top weighted score contributors include:
+- `100/100` cases have cost above `2.0`.
+- `95/100` cases have cost above `3.0`.
+- `95/100` cases have HPWL gap above `1.0`.
+- `87/100` cases have area gap above `1.0`.
+- `81/100` cases have `V_rel` above `0.2`.
 
-- test 98, 119 blocks: cost `6.5084`, HPWL gap `2.0954`, area gap `2.1727`, `V_rel=0.3654`
-- test 99, 120 blocks: cost `4.7489`, HPWL gap `1.8228`, area gap `2.0684`, `V_rel=0.2388`
-- test 95, 116 blocks: cost `6.2041`, HPWL gap `3.4602`, area gap `2.4158`, `V_rel=0.2273`
-- test 92, 113 blocks: cost `6.4900`, HPWL gap `3.0306`, area gap `3.1284`, `V_rel=0.2321`
-- test 89, 110 blocks: cost `7.5461`, HPWL gap `3.2906`, area gap `2.6553`, `V_rel=0.3208`
+This is why the final score is not converging under `2`: the current solver is
+feature-complete and legal, but its placement representation is still a greedy
+constructive frame plus small repair moves. That representation is not finding
+layouts close enough to the provided HPWL/area baselines.
 
 ## Benchmark or Evaluator Details
 
@@ -140,9 +155,13 @@ The evaluator computes feasible cost as:
 * max(0.7, RuntimeFactor ** 0.3)
 ```
 
-Infeasible cases cost exactly `10.0`. Feasible cases are capped at `9.999999`. Local evaluation then resets every runtime factor to `1.0`, so local score is driven by HPWL gap, area gap, and normalized soft violations.
+Infeasible cases cost exactly `10.0`. Feasible cases are capped at `9.999999`.
+Local evaluation resets every runtime factor to `1.0`, so local score is driven
+by HPWL gap, area gap, and normalized soft violations.
 
-The current optimizer does not receive baseline HPWL or baseline area in `solve()`. It ranks candidates with raw HPWL, raw bbox area, and soft-violation counts:
+The current optimizer does not receive baseline HPWL or baseline area in
+`solve()`. It ranks candidates with raw HPWL, raw bbox area, and soft-violation
+counts:
 
 ```text
 PROXY_HPWL_WEIGHT = 1.0
@@ -151,85 +170,149 @@ PROXY_SOFT_WEIGHT = 1000.0
 PROXY_SOFT_EXPONENT = 2.0
 ```
 
-Relevant implementation points:
+Relevant implementation points in `iccad2026contest/my_optimizer.py`:
 
-- `iccad2026contest/my_optimizer.py` uses shelf and rail packers for fallback and construction.
-- `_pack_boundary_frame_candidate()` creates a boundary rail layout, then shelf-packs interior units.
-- `_local_search_shelf_width_trials()` only tries a few shelf widths.
-- `_compact_candidate()` flattens movable blocks into a single row, which can improve feasibility simplicity but is not a true 2D compactor.
+- `CandidateManager` retains only hard-feasible candidates as best candidates.
+- `_pack_boundary_skyline_candidate()` preserves boundary rails and packs the
+  frame interior with bottom-left skyline variants.
+- `_pack_connected_bottom_left_origins()` uses placed-neighbor and pin
+  attraction, but remains one-pass greedy.
+- `_run_local_search()` tries bounded local move families, then bounded
+  rip-up/repack, compaction, boundary snapping, and frame compaction.
+- `_pack_ripup_repack_candidate()` freezes non-window units and cannot compress
+  the current bbox unless selected windows include useful extremes.
+- `_local_search_frame_compaction_trials()` is already present, but it is gated
+  to large boundary cases and only yielded five observed improvements.
 
 ## Observed Bottlenecks
 
-- Soft violations are no longer enough to explain the score. Removing all of them projects `3.2084`, not `<3`.
-- Boundary is still the dominant soft family: weighted boundary violations are `12.2668`, grouping `2.5741`, MIB `0.0`. Boundary is about `82.7%` of the weighted soft numerator.
-- The layouts are sparse after boundary-frame packing. Weighted block density is about `0.3107`, meaning roughly 69% of the bounding box is whitespace.
-- Large layouts have many shelf/rail rows. Weighted approximate row count is about `35.9`; for 116 to 120 block cases it is about `40.7`.
-- HPWL and area are both high, not just one metric. Weighted HPWL gap is `2.2538`; weighted area gap is `2.1630`.
-- The current construction model is still fundamentally order plus shelf/rail placement. It does not perform true 2D packing, skyline placement, sequence-pair packing, or coordinate-level connectivity refinement.
-- MIB is solved on the saved validation result and should not be the next target.
-- Runtime is acceptable locally, but official runtime remains unknown and should be watched if adding more search.
+- The current candidate set is too shallow for `<= 2.0`. Recent quality passes
+  safely improve a few cases but do not change the score regime.
+- Weighted area gap is effectively stuck around `1.66`; frame compaction did
+  not reduce it.
+- Weighted soft violations are stuck around `0.2486`; current boundary, grouping,
+  and MIB handling is not enough to remove the exponential multiplier.
+- HPWL is still high even after connectivity-aware placement and rip-up. A
+  weighted HPWL gap of `1.6416` means the layouts remain far from baseline
+  connectivity quality.
+- Runtime is not the local bottleneck, but it is now large enough that any next
+  search pass must be bounded and targeted at high-weight large cases.
 
 ## Likely Causes
 
-### Cause 1: Boundary Frame Trades Soft Violations for Sparse Geometry
+### Cause 1: Greedy Frame/Skyline Representation Has Hit Its Ceiling
 
 - Type: Algorithmic limitation.
-- Evidence: The boundary-frame pass reduced weighted boundary violations from the prior diagnosis's roughly `27.97` to `12.27`, but the current weighted HPWL and area gaps are `2.2538` and `2.1630`. Saved geometry has weighted density only `0.3107` and about `35.9` row levels. This matches the outer-rail construction in `_pack_boundary_frame_candidate()`, which reserves left/right/top/bottom rails and shelf-packs the interior.
-- Affected modules: `iccad2026contest/my_optimizer.py` functions `_pack_boundary_frame_candidate()`, `_boundary_frame_groups()`, `_pack_shelf_origins()`, `_constructive_seed_orders()`.
-- Risk: Medium. The boundary frame is valuable and should not be removed; it needs a better interior and frame-shape search.
+- Evidence: The largest gains came from introducing boundary frames and skyline
+  packing. Subsequent connectivity, rip-up, and frame-compaction passes improved
+  score only from `4.5564` to `4.3887`; the latest pass changed just `5/100`
+  cases.
+- Affected modules: `iccad2026contest/my_optimizer.py` functions
+  `_constructive_seed_orders()`, `_pack_boundary_skyline_candidate()`,
+  `_pack_connected_bottom_left_origins()`, `_run_local_search()`.
+- Risk: Medium-high. A stronger global representation can improve quality, but
+  must keep hard preflight and runtime bounds.
 - Confidence: High.
 
-### Cause 2: Packing Representation Is Still Shelf-Based
+### Cause 2: Local Search Freezes Too Much Geometry
 
 - Type: Algorithmic limitation.
-- Evidence: Fallback, ordinary constructive seeds, local repacking, and boundary-frame interior all route through shelf-width logic. The only geometry variants are order changes, a small set of shelf widths, and post-hoc snapping/compaction. That explains the high whitespace and high area gap. A score below `3` requires actual geometry improvement; score projections show that soft cleanup alone is insufficient.
-- Affected modules: `iccad2026contest/my_optimizer.py` functions `_pack_units_as_candidate()`, `_pack_shelf_origins()`, `_fallback_compact_shelf_width()`, `_local_search_shelf_width_trials()`, `_compact_candidate()`.
-- Risk: Medium-high. A real 2D packer increases geometry complexity and overlap risk; it must be introduced as an additional candidate seed, not by replacing fallback.
+- Evidence: Rip-up/repack improved weighted HPWL but left weighted area
+  unchanged. Frame compaction only improved five cases and increased weighted
+  area slightly. Current repair moves are too local to reorganize rails,
+  grouped macros, and interior units together.
+- Affected modules: `iccad2026contest/my_optimizer.py` functions
+  `_eligible_ripup_unit_ids()`, `_ripup_windows()`,
+  `_pack_ripup_repack_candidate()`, `_local_search_frame_compaction_trials()`.
+- Risk: Medium. Relaxing anchors can regress boundary or grouping unless every
+  candidate remains preflight-gated.
 - Confidence: High.
 
-### Cause 3: Proxy Ranking Is Not Calibrated to the New Regime
+### Cause 3: Soft Constraints Are Treated More As Penalties Than Construction Goals
 
-- Type: Parameter tuning and evaluator-proxy mismatch.
-- Evidence: The current proxy heavily penalizes soft violations and uses raw HPWL plus `0.01 * bbox_area`, while official scoring uses relative gaps against hidden baselines and a multiplicative soft factor. This was useful when boundary violations dominated, but now zero-soft score is still above `3`, so candidate selection must care more about compactness and HPWL. Since `solve()` lacks official baselines, the proxy cannot be exact, but it can be better normalized by total block area, estimated density, and per-case connectivity scale.
-- Affected modules: `iccad2026contest/my_optimizer.py` constants `PROXY_*` and function `_score_candidate()`.
-- Risk: Medium. Retuning without adding better candidates may only reshuffle weak layouts, so proxy changes should follow or accompany a new geometry seed.
+- Type: Algorithmic limitation and proxy mismatch.
+- Evidence: Weighted `V_rel` stayed `0.2486` across rip-up and frame compaction.
+  Zeroing all soft violations would still not reach `2.0`, but the exponential
+  term is large enough that persistent violations block convergence.
+- Affected modules: `iccad2026contest/my_optimizer.py` functions
+  `_plan_soft_units()`, grouping macro construction, boundary-frame packing,
+  `_score_candidate()`, `_local_search_mib_sync_trials()`.
+- Risk: Medium. Aggressive soft repair can worsen HPWL/area if not jointly
+  optimized.
+- Confidence: Medium-high.
+
+### Cause 4: Proxy Scoring Cannot See Official Relative Baselines
+
+- Type: Evaluator-proxy mismatch.
+- Evidence: Official score uses relative gaps against dataset baselines that are
+  not passed into `solve()`, while the optimizer uses raw HPWL and raw bbox
+  with fixed weights. This can rank candidates incorrectly, especially across
+  cases with different area/pin scales.
+- Affected modules: `iccad2026contest/my_optimizer.py` constants `PROXY_*` and
+  `_score_candidate()`.
+- Risk: Medium. Retuning proxy weights alone is unlikely to beat the current
+  representation ceiling.
 - Confidence: Medium.
 
 ## Optimization Hypotheses
 
 | Priority | Hypothesis | Expected Impact | Risk | Affected Files | Verification |
 |---:|---|---|---|---|---|
-| 1 | Add a boundary-preserving skyline or best-fit interior packer as one new constructive seed. Keep boundary rails, but pack interior units into a denser 2D layout and try a small set of frame aspect ratios on large cases. | High. Targets both area gap and HPWL while preserving most boundary gains. A combined 50% reduction in HPWL/area and 50% soft reduction projects about `2.7142`. | Medium. New geometry can introduce overlap or hurt boundary; keep fallback and current boundary frame unchanged. | `iccad2026contest/my_optimizer.py`, `optimizer_constructive_smoke.py`, `optimizer_local_search_smoke.py`, possibly `optimizer_proxy_scoring_smoke.py` | Smokes, `--validate`, full `--evaluate`; compare score, feasibility, HPWL gap, area gap, boundary/grouping/MIB counts, density, and runtime against 5.3511. |
-| 2 | Add connectivity-aware placement inside the boundary frame: order interior units by B2B/P2B attraction to already placed rails and pins, and place high-connectivity units near related boundary/cluster units. | Medium. Targets HPWL without discarding boundary rails. Prior connectivity-greedy ordering helped only slightly because geometry remained shelf-like; it should be stronger when combined with 2D placement. | Medium. More ordering logic may overfit validation if too specific. | `iccad2026contest/my_optimizer.py`, constructive/proxy smokes | Compare HPWL gap and total score, especially top contributors 98, 95, 92, 89. Roll back if HPWL improves but area/soft makes score worse. |
-| 3 | Recalibrate proxy scoring after adding denser candidates: increase bbox/density influence and reduce soft dominance once boundary violations are already near the current level. | Medium. Better candidate choice can recover from the proxy favoring low-soft sparse layouts over slightly higher-soft compact layouts. | Medium. Proxy-only tuning without new candidates is unlikely to reach `<3`. | `iccad2026contest/my_optimizer.py`, `optimizer_proxy_scoring_smoke.py` | Run before/after evaluator; require improved total score without feasibility loss and inspect family metrics to avoid simply trading one term for another. |
+| 1 | Add a bounded unit-level sequence-pair or B*-tree style global search for large cases, seeded from the current best candidate, with boundary snapping, immutable repair, and hard preflight after every decoded state. Use it only for high-weight `block_count >= 90` or `>= 100` cases at first. | High. This is the first change that directly addresses the greedy representation ceiling and can jointly reduce HPWL/area/soft violations. | High | `iccad2026contest/my_optimizer.py`, `optimizer_local_search_smoke.py`, possibly a new global-search smoke | Smokes, `--validate`, full `--evaluate`; compare score against `4.3887`, weighted HPWL `1.6416`, weighted area `1.6645`, weighted V_rel `0.2486`, avg runtime `0.3620 s`. |
+| 2 | Add a soft-constraint assembly pass before global placement: construct compatible grouping/MIB/boundary units as explicit connected mini-layouts, then allow the global search to move those units instead of fixing rail-heavy geometry too early. | Medium-high. Could reduce the exponential soft multiplier while preserving search freedom. | Medium | `iccad2026contest/my_optimizer.py`, macro/constructive/local-search smokes | Reject if soft improves but HPWL/area regress enough to worsen score. |
+| 3 | Normalize proxy scoring by case scale and add more area-preserving shape/aspect variants for high-connectivity soft blocks. | Medium. Helps candidate ranking after richer candidates exist. | Medium | `iccad2026contest/my_optimizer.py`, proxy/dimension/local-search smokes | Reject if local proxy improves but full evaluator score does not. |
 
 ## Recommended First Optimization
 
-Implement only hypothesis 1 first: add a boundary-preserving skyline or best-fit interior constructive seed.
+Implement only hypothesis 1 first: a bounded unit-level global-search pass for
+large cases.
 
-The goal is not to replace the current boundary frame. The first attempt should add one candidate family that:
+The current local approach has already used the obvious cheap moves:
+connectivity-aware skyline packing, large-case rip-up/repack, and boundary-frame
+compaction. The marginal gain from the last pass was only `0.0192`, so another
+small frame tweak is unlikely to close a `2.3887` score gap.
 
-- reuses existing fixed/preplaced handling, dimensions, grouping macros, MIB metadata, and preflight;
-- keeps boundary-constrained units on outer rails where that is cheap;
-- packs unconstrained and remaining boundary-overflow units with a simple 2D skyline/best-fit strategy instead of shelves only;
-- tries a small bounded set of frame aspect ratios or target widths, with more attention to 101 to 120 block cases;
-- preserves the current fallback, ordinary seeds, `connectivity_greedy`, and existing `boundary_frame` seed as rollback paths;
-- lets `CandidateManager` choose only hard-feasible candidates that improve the proxy score.
+Recommended design:
 
-Why this first:
+- Gate the first version to `block_count >= 100` to target `81.13%` of weighted
+  score and contain runtime risk.
+- Start from `manager.best_feasible_or_fallback()` after existing local search.
+- Build a unit-level representation over current placement units, not raw
+  blocks, so grouping and compatible MIB decisions stay intact.
+- Decode a small set of sequence-pair or B*-tree perturbations into legal
+  rectangular placements using existing dimensions.
+- Seed the initial order from current `(y, x)` and connectivity order; try only
+  a bounded number of deterministic perturbations first.
+- After each decoded candidate, run immutable repair, boundary snapping, MIB
+  repair where compatible, and hard preflight.
+- Submit only hard-feasible candidates to `CandidateManager`.
+- Keep runtime caps conservative. The first target is quality signal, not an
+  exhaustive annealer.
 
-- The current target `<3` cannot be reached by removing soft violations alone.
-- The biggest remaining measured weaknesses are sparse bbox and HPWL, both caused by the shelf/rail geometry model.
-- Adding one new candidate seed is smaller and easier to roll back than replacing local search or rewriting the solver.
-- It aligns with the unresolved design question in `doc/detailed-design.md`: the optimized packing representation was never upgraded beyond deterministic shelves.
+Initial success target:
+
+- Keep `100/100` feasible.
+- Improve total score below `4.3887`.
+- Improve at least one high-weight large case without worsening any case, or
+  improve weighted HPWL and area together.
+- Keep weighted `V_rel <= 0.2486`.
+- Keep average runtime under about `0.60 s/case` for the first version unless
+  the score gain is substantial.
 
 Rollback condition:
 
-- Full local evaluation score is not lower than `5.3511`.
+- Full local evaluation score is not lower than `4.3887`.
 - Feasibility drops below `100/100`.
-- Weighted area or HPWL improves but soft violations rise enough that total score worsens.
-- Average or max runtime rises materially without score improvement.
-- Existing smoke tests fail.
+- Weighted HPWL/area improve in proxy only but not in evaluator output.
+- Runtime rises materially without score improvement.
+- Existing smoke tests or `--validate` fail.
+
+Why not proxy tuning first:
+
+- Proxy tuning cannot create better layouts; it can only select among existing
+  candidates. The current candidate family has plateaued.
+- The score projection shows the target requires large structural improvement,
+  not small changes in candidate ranking.
 
 ## Exact Prompt for Implementation Loop
 
@@ -243,7 +326,8 @@ Read:
 - doc/quality-gates.md
 - relevant source and test files
 
-Implement only the first recommended optimization hypothesis.
+Implement only the first recommended optimization hypothesis:
+bounded unit-level global search for large cases.
 
 Rules:
 - Do not change unrelated modules.
@@ -260,25 +344,43 @@ Rules:
 
 ## Stop Conditions
 
-- Stop if any hard-correctness check becomes unstable or any evaluator run reports fewer than `100/100` feasible cases.
-- Stop if a new packer changes fixed dimensions, preplaced positions, or preplaced dimensions.
-- Stop if the new candidate depends on validation result files, baseline metrics, or dataset files inside `solve()`.
-- Stop if the implementation tries to optimize validation-specific test ids or block counts beyond general contest-scale budget policies.
+- Stop if any hard-correctness check becomes unstable or any evaluator run
+  reports fewer than `100/100` feasible cases.
+- Stop if the global-search decoder changes fixed dimensions, preplaced
+  positions, or preplaced dimensions.
+- Stop if boundary or grouping repair improves soft counts by simply expanding
+  bbox enough to worsen total score.
+- Stop if the implementation depends on validation result files, saved
+  solutions, baseline metrics, or dataset files inside `solve()`.
+- Stop if the implementation optimizes specific validation `test_id` values
+  instead of general block/count/connectivity/constraint structure.
+- Stop if runtime growth dominates score improvement.
 - Stop if local evaluation cannot be run with an approved output-file plan.
 
 ## Risks and Warnings
 
-- The score below `3` target is substantially harder than the previous below-5 target. The current solver needs structural geometry improvement, not another tiny order tweak.
-- Local runtime is neutral, but official runtime can penalize extra candidate generation. Keep the first skyline/best-fit seed bounded.
-- Boundary constraints are still important. Removing the boundary frame would likely regress toward the old `7.1293` regime.
-- Proxy score is not official score because baselines are not passed to `solve()`. Use evaluator runs, not proxy-only comparisons, to decide whether to keep the optimization.
-- The Matplotlib cache warning observed during read-only analysis comes from importing evaluator dependencies with an unwritable `$HOME/.config/matplotlib`; it does not affect the score diagnosis.
-- Generated result JSON files, PNGs, logs, caches, and datasets should remain local artifacts unless explicitly requested for version control.
+- A score around `2.0` is a large jump from `4.3887`; it likely requires
+  multiple measured iterations.
+- The next optimization should target large cases first because cases with
+  `101-120` blocks account for `81.13%` of total score weight.
+- Soft cleanup alone is insufficient: zeroing all current soft violations still
+  projects `2.6531`.
+- Half-sized improvements across HPWL, area, and soft violations still project
+  only `2.3461`, so the eventual implementation needs stronger than half-way
+  progress in at least one major term.
+- Local runtime is neutral, but official runtime can penalize extra search.
+- Generated result JSON files, PNGs, logs, caches, and datasets should remain
+  local artifacts unless explicitly requested for version control.
 
 ## Open Questions
 
-- What official runtime increase is acceptable if a denser boundary-preserving packer improves score?
-- Should the new 2D packer be skyline/best-fit, guillotine, or sequence-pair-style for the first attempt?
-- Should proxy retuning be allowed in the same implementation loop if the new seed generates better candidates but the current proxy rejects them?
-- Should the next target be strict `<3.0`, or should the next implementation loop use an intermediate keep/rollback threshold such as `<5.0`, `<4.5`, then `<3.5`?
-- Are helper modules allowed in final submission, or should all optimizer changes remain single-file?
+- What official runtime increase is acceptable if a global-search pass improves
+  score?
+- Should the first global-search decoder use sequence pair, B*-tree, or a
+  simpler two-order bottom-left decoder?
+- Should source attribution be added to saved diagnostics so future analysis can
+  identify which candidate family won each test case?
+- Should soft-constraint macro assembly happen before or after the first global
+  representation pass?
+- Are model weights allowed in final submission, and what size/path limits
+  apply?

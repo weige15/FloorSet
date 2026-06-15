@@ -94,8 +94,9 @@ def test_seed_orders_are_named_and_bounded() -> None:
         "boundary_frame",
         "grouping_macro_priority",
         "boundary_skyline",
+        "boundary_skyline_connected",
     ]
-    assert len(seed_orders) == 8
+    assert len(seed_orders) == 9
     assert all(len(order) == len(units.units) for _, order, _ in seed_orders)
 
 
@@ -279,6 +280,23 @@ def test_boundary_skyline_seed_is_hard_feasible_and_can_reduce_bbox() -> None:
     assert _bbox_area(boundary_skyline.positions) < _bbox_area(boundary_frame.positions)
 
 
+def test_connected_boundary_skyline_prioritizes_pin_attraction() -> None:
+    context = _context(
+        [4.0, 4.0, 4.0],
+        p2b=[[0, 2, 100.0]],
+        pins=[[0.0, 0.0]],
+    )
+    _, candidates = _constructive_candidates(context)
+    connected = next(
+        candidate for candidate in candidates
+        if candidate.source.startswith("constructive:boundary_skyline_connected:")
+    )
+
+    assert connected.positions[2] == (0.0, 0.0, 2.0, 2.0)
+    assert connected.hard_report is not None
+    assert connected.hard_report.hard_feasible
+
+
 def test_grouping_macro_expands_as_edge_connected_unit() -> None:
     context = _context(
         [4.0, 9.0, 16.0],
@@ -319,6 +337,7 @@ def run_smoke() -> None:
     test_boundary_frame_seed_places_right_top_units_late()
     test_boundary_frame_seed_packs_non_overlapping_outer_rails()
     test_boundary_skyline_seed_is_hard_feasible_and_can_reduce_bbox()
+    test_connected_boundary_skyline_prioritizes_pin_attraction()
     test_grouping_macro_expands_as_edge_connected_unit()
     test_candidate_manager_retains_fallback_when_constructive_candidate_is_malformed()
 

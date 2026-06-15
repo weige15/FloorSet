@@ -39,6 +39,7 @@ Dimension Planner; Immutable Geometry Registry; Macro and Soft-Constraint Planne
 - 2026-06-14 optimization: Added a deterministic `connectivity_greedy` seed that builds unit-level B2B adjacency, starts from the strongest incident movable unit, and then appends units by strongest connection to the placed frontier. The seed reuses the existing shelf packer and hard-preflighted Candidate Manager path.
 - 2026-06-14 optimization: Replaced the order-only `boundary_frame` behavior with a deterministic outer-rail packer. Boundary-constrained movable units are partitioned into left/right/top/bottom/corner rails, same-edge units are stacked without overlap, unconstrained units are packed in the interior, and the expanded candidate still goes through hard preflight and Candidate Manager scoring.
 - 2026-06-14 optimization: Added a bounded `boundary_skyline` seed. It preserves the existing boundary-frame rail convention but tries bottom-left best-fit packing for frame interiors and for non-boundary movable units across a small fixed set of width hints, then keeps only the hard-feasible variant with the best proxy key.
+- 2026-06-15 optimization: Added a bounded `boundary_skyline_connected` seed. It preserves the existing boundary-skyline rail convention but packs non-boundary/interior units with a connectivity-aware bottom-left chooser that prioritizes links to already placed blocks and fixed pins while still including bbox growth in the site key.
 
 ## Tests and Quality Gates
 

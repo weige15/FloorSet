@@ -17,9 +17,11 @@ from my_optimizer import (
     _build_fallback,
     _build_immutable_geometry,
     _compact_candidate,
+    _local_search_frame_compaction_trials,
     _local_search_budget,
     _parse_inputs,
     _plan_dimensions,
+    _plan_soft_units,
     _preflight,
     _run_local_search,
     _snap_boundary_candidate,
@@ -81,7 +83,10 @@ def test_budget_policy_is_block_count_bounded() -> None:
     assert _local_search_budget(1).max_trials == 0
     assert _local_search_budget(21).max_trials == 20
     assert _local_search_budget(60).max_trials == 25
-    assert _local_search_budget(120).max_trials == 32
+    assert _local_search_budget(80).ripup_trials == 4
+    assert _local_search_budget(120).max_trials == 38
+    assert _local_search_budget(120).ripup_trials == 6
+    assert _local_search_budget(120).frame_compaction_trials == 2
     assert _local_search_budget(120).max_trials < 40
 
 
@@ -278,6 +283,90 @@ def test_candidate_manager_keeps_feasible_when_later_local_trial_is_bad() -> Non
     assert manager.best_feasible_or_fallback().hard_report.hard_feasible
 
 
+def test_large_case_ripup_repack_trials_are_feasible_and_freeze_boundary_units() -> None:
+    areas = [1.0 for _ in range(85)]
+    constraints = [[0, 0, 0, 0, 0] for _ in areas]
+    constraints[0][4] = 1
+    context = _context(
+        areas,
+        constraints=constraints,
+        b2b=[
+            [10, 84, 100.0],
+            [11, 83, 80.0],
+            [12, 82, 60.0],
+        ],
+    )
+    manager = _manager_with_fallback(context)
+    fallback = manager.best_feasible_or_fallback()
+    candidates = list(_run_local_search(context, manager))
+    ripup_trials = [
+        candidate for candidate in candidates
+        if candidate.source.startswith("local:ripup_repack:")
+    ]
+
+    assert ripup_trials
+    assert len(ripup_trials) <= _local_search_budget(context.parsed.n).ripup_trials
+    for candidate in ripup_trials:
+        _assert_hard_feasible(context, candidate)
+        assert candidate.positions[0] == fallback.positions[0]
+
+
+def test_large_boundary_frame_compaction_slides_rails_and_reduces_bbox() -> None:
+    areas = [1.0 for _ in range(105)]
+    constraints = [[0, 0, 0, 0, 0] for _ in areas]
+    constraints[0][4] = 1
+    constraints[1][4] = 2
+    constraints[2][4] = 4
+    constraints[3][4] = 8
+    context = _context(
+        areas,
+        constraints=constraints,
+        b2b=[
+            [0, 4, 10.0],
+            [1, 104, 10.0],
+            [2, 40, 10.0],
+            [3, 41, 10.0],
+        ],
+    )
+    start_positions = [
+        (0.0, 9.0, 1.0, 1.0),
+        (39.0, 9.0, 1.0, 1.0),
+        (18.0, 19.0, 1.0, 1.0),
+        (18.0, 0.0, 1.0, 1.0),
+    ]
+    start_positions.extend(
+        (float((idx - 4) * 2), 2.0, 1.0, 1.0)
+        for idx in range(4, 105)
+    )
+    start = Candidate(start_positions, "manual:wide_frame", 1)
+    start.hard_report = _preflight(
+        start,
+        context.parsed,
+        context.immutable,
+        context.dimensions,
+    )
+    assert start.hard_report.hard_feasible
+
+    unit_set = _plan_soft_units(context)
+    candidates = list(
+        _local_search_frame_compaction_trials(
+            context,
+            unit_set,
+            start,
+            _local_search_budget(context.parsed.n),
+            500,
+        )
+    )
+
+    assert candidates
+    assert len(candidates) <= _local_search_budget(context.parsed.n).frame_compaction_trials
+    best = min(candidates, key=lambda candidate: _bbox_area(candidate.positions))
+    _assert_hard_feasible(context, best)
+    assert best.hard_report is not None
+    assert best.hard_report.boundary_violations == 0
+    assert _bbox_area(best.positions) < _bbox_area(start.positions) * 0.5
+
+
 def test_synthetic_21_60_120_cases_stay_within_trial_budget() -> None:
     for block_count in (21, 60, 120):
         areas = [float((idx % 7) + 1) for idx in range(block_count)]
@@ -314,6 +403,8 @@ def run_smoke() -> None:
     test_incompatible_mib_search_preserves_area_feasibility()
     test_boundary_snap_after_compaction_and_outside_overlap_repair()
     test_candidate_manager_keeps_feasible_when_later_local_trial_is_bad()
+    test_large_case_ripup_repack_trials_are_feasible_and_freeze_boundary_units()
+    test_large_boundary_frame_compaction_slides_rails_and_reduces_bbox()
     test_synthetic_21_60_120_cases_stay_within_trial_budget()
 
 
